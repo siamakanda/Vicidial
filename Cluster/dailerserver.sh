@@ -1,18 +1,37 @@
 #!/usr/bin/env bash
-# Script to safely update Dialer Server crontab with automatic backup
+#
+# VICIdial Cluster - Dialer / Telephony (Asterisk) node crontab.
+# Replaces the current crontab with a node-local schedule only (no cluster-wide
+# DB maintenance jobs) and keeps a timestamped backup in /root.
+# Run this on EVERY dialer node in the cluster.
+#
+set -euo pipefail
 
-# 1. Create a timestamped backup of the current crontab
-BACKUP_FILE="/root/crontab_backup_dialer_$(date +%Y%m%d_%H%M%S).txt"
-crontab -l > "$BACKUP_FILE" 2>/dev/null
-
-if [ -s "$BACKUP_FILE" ]; then
-    echo "[+] Current crontab backed up to: $BACKUP_FILE"
-else
-    echo "[!] Warning: Existing crontab was empty or failed to back up."
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[!] This script must be run as root (try: sudo bash $0)" >&2
+    exit 1
 fi
 
-# 2. Apply the new optimized crontab
-cat << 'EOF' | crontab -
+# 1. Create a timestamped backup of the current crontab
+BACKUP_DIR="${BACKUP_DIR:-/root}"
+mkdir -p "$BACKUP_DIR"
+BACKUP_FILE="$BACKUP_DIR/crontab_backup_dialer_$(date +%Y%m%d_%H%M%S).txt"
+
+if crontab -l >"$BACKUP_FILE" 2>/dev/null && [ -s "$BACKUP_FILE" ]; then
+    echo "[+] Existing crontab backed up to: $BACKUP_FILE"
+else
+    rm -f "$BACKUP_FILE"
+    BACKUP_FILE=""
+    echo "[!] No existing crontab found - nothing to back up."
+fi
+
+# 2. Build the new optimized crontab in a temp file, then install it
+TMP_CRON="$(mktemp)"
+trap 'rm -f "$TMP_CRON"' EXIT
+
+cat >"$TMP_CRON" <<'EOF'
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 ### Audio Sync hourly
 * 1 * * * /usr/share/astguiclient/ADMIN_audio_store_sync.pl --upload --quiet
 
@@ -34,9 +53,9 @@ cat << 'EOF' | crontab -
 11 * * * * /usr/share/astguiclient/AST_flush_DBqueue.pl -q
 
 ### Remove local old recordings & logs
-24 1 * * * /usr/bin/find /var/spool/asterisk/monitorDONE/ORIG -maxdepth 2 -type f -mtime +1 -print | xargs rm -f
-28 0 * * * /usr/bin/find /var/log/astguiclient -maxdepth 1 -type f -mtime +2 -print | xargs rm -f
-29 0 * * * /usr/bin/find /var/log/asterisk -maxdepth 3 -type f -mtime +2 -print | xargs rm -f
+24 1 * * * /usr/bin/find /var/spool/asterisk/monitorDONE/ORIG -maxdepth 2 -type f -mtime +1 -print | xargs -r rm -f
+28 0 * * * /usr/bin/find /var/log/astguiclient -maxdepth 1 -type f -mtime +2 -print | xargs -r rm -f
+29 0 * * * /usr/bin/find /var/log/asterisk -maxdepth 3 -type f -mtime +2 -print | xargs -r rm -f
 
 ### Dynamic Firewall
 @reboot /usr/bin/VB-firewall --whitelist=ViciWhite --dynamic --quiet
@@ -48,4 +67,12 @@ cat << 'EOF' | crontab -
 * * * * * sleep 50; /usr/bin/VB-firewall --white --dynamic --quiet
 EOF
 
-echo "[+] Dialer Server crontab successfully updated!"
+if ! crontab "$TMP_CRON"; then
+    echo "[!] Failed to install the new crontab - the previous crontab is unchanged." >&2
+    exit 1
+fi
+
+echo "[+] Dialer server crontab successfully updated."
+if [ -n "$BACKUP_FILE" ]; then
+    echo "[i] Roll back with: crontab $BACKUP_FILE"
+fi
