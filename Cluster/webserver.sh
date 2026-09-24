@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# VICIdial Cluster - Main / Web / DB server crontab.
-# Replaces the current crontab with an optimized, staggered cluster schedule
-# and keeps a timestamped backup of the previous crontab in /root.
+# VICIdial Cluster - Main / Web / DB server crontab & Binary Logging Setup.
+# Replaces current crontab with an optimized schedule, backs up old crontab,
+# and enables MySQL/MariaDB binary logging for replication.
 #
 set -euo pipefail
 
@@ -111,4 +111,98 @@ fi
 echo "[+] Main server crontab successfully updated."
 if [ -n "$BACKUP_FILE" ]; then
     echo "[i] Roll back with: crontab $BACKUP_FILE"
+fi
+
+# 3. Configure MariaDB Binary Logging
+echo "[+] Setting up MySQL/MariaDB Binary Logging..."
+
+# Locate configuration file
+CONF_FILE=""
+if [ -f "/etc/my.cnf" ]; then
+    CONF_FILE="/etc/my.cnf"
+elif [ -f "/etc/mysql/mariadb.conf.d/50-server.cnf" ]; then
+    CONF_FILE="/etc/mysql/mariadb.conf.d/50-server.cnf"
+elif [ -f "/etc/mysql/my.cnf" ]; then
+    CONF_FILE="/etc/mysql/my.cnf"
+fi
+
+if [ -z "$CONF_FILE" ]; then
+    echo "[!] Could not locate MySQL/MariaDB configuration file. Skipping binlog config." >&2
+else
+    # Ensure log directory exists with correct permissions
+    mkdir -p /var/log/mysql
+    chown -R mysql:mysql /var/log/mysql 2>/dev/null || true
+
+    # On SELinux systems (RHEL/AlmaLinux) mysqld needs the mysqld_log_t label
+    # on the binlog directory or the service will refuse to start.
+    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+        if command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1; then
+            semanage fcontext -a -t mysqld_log_t '/var/log/mysql(/.*)?' 2>/dev/null || true
+            restorecon -R /var/log/mysql 2>/dev/null || true
+        else
+            echo "[!] SELinux is enforcing but 'semanage' is missing; mysqld may be unable" >&2
+            echo "    to write to /var/log/mysql. Install policycoreutils-python-utils." >&2
+        fi
+    fi
+
+    # Check if binary logging is already configured (an active directive, not a comment)
+    if grep -Eq '^[[:space:]]*log_bin[[:space:]]*=' "$CONF_FILE"; then
+        echo "[i] Binary logging already enabled in $CONF_FILE."
+    else
+        echo "[+] Backing up $CONF_FILE to ${CONF_FILE}.bak"
+        cp "$CONF_FILE" "${CONF_FILE}.bak"
+
+        # Append parameters under [mysqld]
+        if grep -q "^\[mysqld\]" "$CONF_FILE"; then
+            sed -i '/^\[mysqld\]/a \
+server-id        = 1\
+log_bin          = /var/log/mysql/mariadb-bin\
+log_bin_index    = /var/log/mysql/mariadb-bin.index\
+expire_logs_days = 7\
+max_binlog_size  = 100M\
+binlog_format    = MIXED' "$CONF_FILE"
+        else
+            cat << 'MYCNF' >> "$CONF_FILE"
+
+[mysqld]
+server-id        = 1
+log_bin          = /var/log/mysql/mariadb-bin
+log_bin_index    = /var/log/mysql/mariadb-bin.index
+expire_logs_days = 7
+max_binlog_size  = 100M
+binlog_format    = MIXED
+MYCNF
+        fi
+        echo "[+] Binary logging configuration added to $CONF_FILE"
+
+        # Restart MariaDB/MySQL to apply changes (roll the config back on failure)
+        DB_SVC=""
+        for svc in mariadb mysqld mysql; do
+            if systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -q "^${svc}\.service"; then
+                DB_SVC="$svc"
+                break
+            fi
+        done
+
+        if [ -z "$DB_SVC" ]; then
+            echo "[!] Could not determine the database service name. Restart MariaDB/MySQL manually to apply." >&2
+        else
+            echo "[+] Restarting $DB_SVC to apply binary logging..."
+            if systemctl restart "$DB_SVC"; then
+                echo "[+] $DB_SVC restarted successfully."
+            else
+                echo "[!] $DB_SVC failed to restart - rolling back ${CONF_FILE}." >&2
+                cp -f "${CONF_FILE}.bak" "$CONF_FILE"
+                systemctl restart "$DB_SVC" || true
+                echo "[!] Configuration rolled back. Binary logging was NOT enabled." >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# 4. Verify Binary Logging
+if command -v mysql &>/dev/null; then
+    echo "[+] Verifying Binary Logging Status:"
+    mysql -e "SHOW MASTER STATUS\G" 2>/dev/null || mysql -e "SHOW BINLOG STATUS\G" 2>/dev/null || echo "[!] Unable to fetch binlog status."
 fi

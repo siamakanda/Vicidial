@@ -24,12 +24,28 @@ window the client reports.
 
 | Script | Run on | Effect |
 | --- | --- | --- |
-| `Cluster/webserver.sh` | Main / Web / DB server | Keeps all cluster-wide DB + report jobs, but staggers them into off-peak hours |
+| `Cluster/webserver.sh` | Main / Web / DB server | Keeps all cluster-wide DB + report jobs (staggered off-peak) **and enables MariaDB binary logging** (restarts the DB service) |
 | `Cluster/dailerserver.sh` | Every Dialer / Asterisk node | Keeps only node-local jobs (audio mix/compress, keepalives, local log purge) and removes the duplicated cluster-wide DB jobs |
 
 Both scripts write a timestamped backup of the existing crontab to
 `/root/crontab_backup_*.txt` **before** changing anything, and refuse to run
 unless they are root.
+
+## Main server also enables MariaDB binary logging
+
+On the main server, `webserver.sh` additionally prepares the replication master:
+it adds `server-id`, `log_bin`, `log_bin_index`, `expire_logs_days`,
+`max_binlog_size` and `binlog_format` under `[mysqld]` (saving the config to
+`<file>.bak` first), labels `/var/log/mysql` for SELinux, and restarts
+MariaDB/MySQL to apply it.
+
+> **This restarts the database** - run it in a maintenance window. If the
+> service fails to restart, the script restores the config backup automatically
+> and exits with an error.
+>
+> If binary logging is already configured, no changes are made. Note
+> `expire_logs_days` is deprecated on MySQL 8.4+ / MariaDB 10.6+
+> (`binlog_expire_logs_seconds` is the modern equivalent).
 
 ## Requirements
 
