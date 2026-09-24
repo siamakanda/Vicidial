@@ -17,8 +17,9 @@ at the same minute — so the primary database is hit by every node at once:
 - log / recording purge `find ... | xargs rm`
 
 The cluster's cron runs in **UTC** while the client is **UTC+6**, so the
-`00:00`–`00:05 UTC` batch lands at **06:00**–**06:05 Dhaka time** — exactly the
-window the client reports.
+default `00:00`–`00:05 UTC` batch lands at **06:00**–**06:05 Dhaka time** —
+exactly the window the client reports. The fix moves every heavy job into the
+client's quiet hours (see [Off-peak window](#off-peak-window)).
 
 ## What the scripts do
 
@@ -30,6 +31,29 @@ window the client reports.
 Both scripts write a timestamped backup of the existing crontab to
 `/root/crontab_backup_*.txt` **before** changing anything, and refuse to run
 unless they are root.
+
+## Off-peak window
+
+The heavy maintenance jobs are pinned to the client's quiet hours —
+**11:00 PM – 7:00 AM MST**, which is **06:00 – 14:00 UTC** on the cluster's
+cron clock:
+
+| Job (main server) | UTC | MST |
+| --- | --- | --- |
+| `ADMIN_adjust_GMTnow_on_leads.pl` | 06:30 & 12:30 | 11:30 PM & 5:30 AM |
+| `ADMIN_archive_log_tables.pl` (1st) | 07:00 | 12:00 AM |
+| `AST_cleanup_agent_log.pl --last-24hours` | 08:00 | 1:00 AM |
+| `AST_DB_optimize.pl` | 09:00 | 2:00 AM |
+| `AST_reset_mysql_vars.pl` | 09:30 | 2:30 AM |
+| `AST_DB_dead_cb_purge.pl` | 10:00 | 3:00 AM |
+| `ADMIN_backup.pl` | 11:00 | 4:00 AM |
+| `AST_agent_week.pl` / `AST_agent_day.pl` | 11:30 | 4:30 AM |
+| log / recording purge | 12:00 | 5:00 AM |
+| `AST_dialer_inventory_snapshot.pl` | 13:00 | 6:00 AM |
+
+Each job sits on its own minute so no two cluster-wide locks line up. On a
+dialer node `dailerserver.sh` prompts for the off-peak start hour (UTC) and
+runs only the node-local cleanup there.
 
 ## Main server also enables MariaDB binary logging
 
